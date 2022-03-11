@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -20,6 +21,8 @@ type RaftSurfstore struct {
 
 	commitIndex    int64
 	pendingCommits []chan bool
+
+	lastApplied int64
 
 	// Server Info
 	ip       string
@@ -54,7 +57,22 @@ func (s *RaftSurfstore) GetBlockStoreAddr(ctx context.Context, empty *emptypb.Em
 }
 
 func (s *RaftSurfstore) UpdateFile(ctx context.Context, filemeta *FileMetaData) (*Version, error) {
-	panic("todo")
+	op := UpdateOperation{
+		Term:         s.term,
+		FileMetaData: filemeta,
+	}
+
+	s.log = append(s.log, &op)
+	committed := make(chan bool)
+	s.pendingCommits = append(s.pendingCommits, committed)
+
+	go s.attemptCommit()
+
+	success := <-committed
+	if success {
+		return s.metaStore.UpdateFile(ctx, filemeta)
+	}
+
 	return nil, nil
 }
 
