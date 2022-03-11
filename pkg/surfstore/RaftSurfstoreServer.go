@@ -3,6 +3,7 @@ package surfstore
 import (
 	context "context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -44,7 +45,7 @@ type RaftSurfstore struct {
 }
 
 func (s *RaftSurfstore) GetFileInfoMap(ctx context.Context, empty *emptypb.Empty) (*FileInfoMap, error) {
-	if s.isLeader {
+	if s.isLeader || !s.isCrashed {
 		return &FileInfoMap{FileInfoMap: s.metaStore.FileMetaMap}, nil
 	}
 
@@ -53,10 +54,18 @@ func (s *RaftSurfstore) GetFileInfoMap(ctx context.Context, empty *emptypb.Empty
 
 func (s *RaftSurfstore) GetBlockStoreAddr(ctx context.Context, empty *emptypb.Empty) (*BlockStoreAddr, error) {
 
-	return &BlockStoreAddr{Addr: s.metaStore.BlockStoreAddr}, nil
+	if !s.isCrashed {
+		return &BlockStoreAddr{Addr: s.metaStore.BlockStoreAddr}, nil
+	}
+
+	return nil, fmt.Errorf("ERR_SERVER_CRASHED")
 }
 
 func (s *RaftSurfstore) UpdateFile(ctx context.Context, filemeta *FileMetaData) (*Version, error) {
+
+	if s.isCrashed {
+		return &Version{Version: -1}, fmt.Errorf("ERR_SERVER_CRASHED")
+	}
 	op := UpdateOperation{
 		Term:         s.term,
 		FileMetaData: filemeta,
