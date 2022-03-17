@@ -46,14 +46,25 @@ type RaftSurfstore struct {
 
 func (s *RaftSurfstore) GetFileInfoMap(ctx context.Context, empty *emptypb.Empty) (*FileInfoMap, error) {
 
-	// if s.isCrashed {
-	// 	return nil, errors.New("crashed")
-	// }
+	if s.isCrashed {
+		return nil, errors.New("ERR_SERVER_CRASHED")
+	}
 
 	// check if more than half the nodes are up
 
 	if s.isLeader {
-		return &FileInfoMap{FileInfoMap: s.metaStore.FileMetaMap}, nil
+		for {
+			succ, err := s.SendHeartbeat(ctx, &emptypb.Empty{})
+			if err != nil {
+				continue
+			}
+			if succ.Flag == true {
+				return &FileInfoMap{FileInfoMap: s.metaStore.FileMetaMap}, nil
+			} else {
+				break
+			}
+
+		}
 	}
 
 	return nil, errors.New("not a leader")
@@ -61,19 +72,15 @@ func (s *RaftSurfstore) GetFileInfoMap(ctx context.Context, empty *emptypb.Empty
 
 func (s *RaftSurfstore) GetBlockStoreAddr(ctx context.Context, empty *emptypb.Empty) (*BlockStoreAddr, error) {
 
-	// if !s.isCrashed {
-	// 	return &BlockStoreAddr{Addr: s.metaStore.BlockStoreAddr}, nil
-	// }
-
 	return &BlockStoreAddr{Addr: s.metaStore.BlockStoreAddr}, nil
-	// return nil, errors.New("server crashed")
+
 }
 
 func (s *RaftSurfstore) UpdateFile(ctx context.Context, filemeta *FileMetaData) (*Version, error) {
 
-	// if s.isCrashed {
-	// 	return &Version{Version: -1}, errors.New("server crashed")
-	// }
+	if s.isCrashed {
+		return &Version{Version: -1}, errors.New("server crashed")
+	}
 	op := UpdateOperation{
 		Term:         s.term,
 		FileMetaData: filemeta,
@@ -97,7 +104,7 @@ func (s *RaftSurfstore) attemptCommit() {
 
 	targetIdx := s.commitIndex + 1
 	commitChan := make(chan *AppendEntryOutput, len(s.ipList))
-	for idx, _ := range s.ipList {
+	for idx := range s.ipList {
 		if int64(idx) == s.serverId {
 			continue
 		}
@@ -161,6 +168,10 @@ func (s *RaftSurfstore) commitEntry(serverIdx, entryIdx int64, commitChan chan *
 //of last new entry)
 func (s *RaftSurfstore) AppendEntries(ctx context.Context, input *AppendEntryInput) (*AppendEntryOutput, error) {
 
+	if s.isCrashed {
+		return nil, errors.New("ERR_SERVER_CRASHED")
+	}
+
 	output := &AppendEntryOutput{
 		ServerId:     s.serverId,
 		Term:         s.term,
@@ -174,21 +185,21 @@ func (s *RaftSurfstore) AppendEntries(ctx context.Context, input *AppendEntryInp
 	}
 	//
 	//1. Reply false if term < currentTerm (§5.1)
-	// if input.Term < s.term {
-	// 	return output, errors.New("append from stale leader")
-	// }
+	if input.Term < s.term {
+		return output, errors.New("append from stale leader")
+	}
 
 	//2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
 	//matches prevLogTerm (§5.3)
-	// if int64(len(s.log)) > input.PrevLogIndex && s.log[input.PrevLogIndex].Term != input.PrevLogTerm {
-	// 	return output, errors.New("prev log mismatch")
-	// }
+	if input.PrevLogIndex > -1 && int64(len(s.log)) > input.PrevLogIndex && s.log[input.PrevLogIndex].Term != input.PrevLogTerm {
+		return output, errors.New("prev log mismatch")
+	}
 
 	//3. If an existing entry conflicts with a new one (same index but different
 	//terms), delete the existing entry and all that follow it (§5.3)
-	// if int64(len(s.log)) > input.PrevLogIndex+1 && s.log[input.PrevLogIndex+1].Term != input.Term {
-	// 	s.log = s.log[:input.PrevLogIndex+1]
-	// }
+	if int64(len(s.log)) > input.PrevLogIndex+1 && s.log[input.PrevLogIndex+1].Term != input.Term {
+		s.log = s.log[:input.PrevLogIndex+1]
+	}
 
 	//4. Append any new entries not already in the log
 	s.log = append(s.log, input.Entries...)
@@ -225,7 +236,11 @@ func (s *RaftSurfstore) SetLeader(ctx context.Context, _ *emptypb.Empty) (*Succe
 // Send a 'Heartbeat" (AppendEntries with no log entries) to the other servers
 // Only leaders send heartbeats, if the node is not the leader you can return Success = false
 func (s *RaftSurfstore) SendHeartbeat(ctx context.Context, _ *emptypb.Empty) (*Success, error) {
-
+	serversAlive := 0
+	serversCrashed := 0
+	if !s.isLeader {
+		return &Success{Flag: false}, nil
+	}
 	for idx, addr := range s.ipList {
 		if int64(idx) == s.serverId {
 			continue
@@ -233,7 +248,7 @@ func (s *RaftSurfstore) SendHeartbeat(ctx context.Context, _ *emptypb.Empty) (*S
 
 		conn, err := grpc.Dial(addr, grpc.WithInsecure())
 		if err != nil {
-			return nil, nil
+			continue
 		}
 		client := NewRaftSurfstoreClient(conn)
 
@@ -250,12 +265,25 @@ func (s *RaftSurfstore) SendHeartbeat(ctx context.Context, _ *emptypb.Empty) (*S
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		output, err := client.AppendEntries(ctx, input)
-		if output != nil {
-			// server is alive
+		if err != nil {
+			continue
 		}
-	}
+		if output != nil {
+			if output.Success == true {
+				serversAlive++
+			}
+		} else {
+			serversCrashed++
+		}
 
-	return &Success{Flag: true}, nil
+	}
+	if serversCrashed > len(s.ipList)/2 {
+		return &Success{Flag: false}, errors.New("ERR_SERVERS_CRASHED")
+	}
+	if serversAlive > len(s.ipList)/2 {
+		return &Success{Flag: true}, nil
+	}
+	return &Success{Flag: false}, nil
 }
 
 func (s *RaftSurfstore) Crash(ctx context.Context, _ *emptypb.Empty) (*Success, error) {
